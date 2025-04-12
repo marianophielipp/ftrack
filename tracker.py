@@ -80,77 +80,93 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import math
-import socket
-import struct
-import argparse
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64MultiArray
 
-# --- Parse command-line arguments ---
-parser = argparse.ArgumentParser(description="Face Tracker UDP Sender (Green Point Estimation)")
-parser.add_argument("--ip", default="127.0.0.1", help="Robot controller IP (default: 127.0.0.1)")
-parser.add_argument("--port", type=int, default=65432, help="UDP port (default: 65432)")
-args = parser.parse_args()
+class FaceTracker(Node):
+    def __init__(self):
+        super().__init__('face_tracker')
+        self.publisher = self.create_publisher(
+            Float64MultiArray,
+            '/head_forward_position_controller/commands',
+            10
+        )
+        
+        # Joint limits from URDF
+        self.pan_limits = (-0.523, 0.523)  # head_0 joint limits in radians
+        self.tilt_limits = (-0.35, 1.57)   # head_1 joint limits in radians
+        
+        # MediaPipe setup
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False, refine_landmarks=True)
+        
+        # Landmark indices for the eyes
+        self.LEFT_EYE = 468  # iris center left
+        self.RIGHT_EYE = 473  # iris center right
+        
+        # Focal length for pinhole model
+        self.focal_length = 500.0
+        
+        # Start video capture
+        self.cap = cv2.VideoCapture(0)
+        self.timer = self.create_timer(0.1, self.track_face)  # 10Hz update rate
 
-# --- Set up UDP socket ---
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def track_face(self):
+        success, frame = self.cap.read()
+        if not success:
+            return
 
-# --- MediaPipe setup ---
-mp_face_mesh = mp.solutions.face_mesh
-# For live video, set static_image_mode=False
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, refine_landmarks=True)
+        h, w, _ = frame.shape
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.face_mesh.process(rgb)
 
-# Landmark indices for the eyes
-LEFT_EYE = 468  # iris center left
-RIGHT_EYE = 473  # iris center right
+        if result.multi_face_landmarks:
+            for face_landmarks in result.multi_face_landmarks:
+                def get_coords(idx):
+                    lm = face_landmarks.landmark[idx]
+                    return np.array([lm.x * w, lm.y * h])
+                
+                left_eye_pt = get_coords(self.LEFT_EYE)
+                right_eye_pt = get_coords(self.RIGHT_EYE)
+                
+                # Compute green point (midpoint between eyes)
+                green_point = (left_eye_pt + right_eye_pt) / 2.0
+                
+                # Draw a green circle at the green point for visualization
+                cv2.circle(frame, tuple(green_point.astype(int)), 5, (0, 255, 0), -1)
+                
+                # Compute the offset from the image center
+                center = np.array([w / 2, h / 2])
+                offset = green_point - center
 
-# Choose a focal length (in pixels) for our pinhole model.
-# This value will affect the sensitivity of the computed angles.
-focal_length = 500.0  # Adjust as needed
+                # Compute raw angles
+                pan_angle = -math.atan2(offset[0], self.focal_length)  # in radians
+                tilt_angle = math.atan2(offset[1], self.focal_length)  # in radians
+                
+                # Scale angles to joint limits
+                pan_angle = np.clip(pan_angle, self.pan_limits[0], self.pan_limits[1])
+                tilt_angle = np.clip(tilt_angle, self.tilt_limits[0], self.tilt_limits[1])
+                
+                # Create and publish ROS message
+                msg = Float64MultiArray()
+                msg.data = [pan_angle, tilt_angle]
+                self.publisher.publish(msg)
+                
+                # Print angles for debugging
+                self.get_logger().info(f'Pan: {math.degrees(pan_angle):.2f}°, Tilt: {math.degrees(tilt_angle):.2f}°')
+        
+        cv2.imshow("Face Tracker (Green Point)", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            self.destroy_node()
+            rclpy.shutdown()
 
-cap = cv2.VideoCapture(0)
+def main():
+    rclpy.init()
+    face_tracker = FaceTracker()
+    rclpy.spin(face_tracker)
+    face_tracker.cap.release()
+    cv2.destroyAllWindows()
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        break
-
-    h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = face_mesh.process(rgb)
-
-    if result.multi_face_landmarks:
-        for face_landmarks in result.multi_face_landmarks:
-            # Helper: convert normalized landmark to pixel coordinates (only x and y here)
-            def get_coords(idx):
-                lm = face_landmarks.landmark[idx]
-                return np.array([lm.x * w, lm.y * h])
-            
-            left_eye_pt = get_coords(LEFT_EYE)
-            right_eye_pt = get_coords(RIGHT_EYE)
-            
-            # Compute green point (midpoint between eyes)
-            green_point = (left_eye_pt + right_eye_pt) / 2.0
-            
-            # Draw a green circle at the green point for visualization.
-            cv2.circle(frame, tuple(green_point.astype(int)), 5, (0, 255, 0), -1)
-            
-            # Compute the offset from the image center.
-            center = np.array([w / 2, h / 2])
-            offset = green_point - center
-
-            # Compute angles based on a simple pinhole camera model.
-            # Pan: horizontal angle; Tilt: vertical angle.
-            pan_angle = -math.degrees(math.atan2(offset[0], focal_length))
-            tilt_angle = math.degrees(math.atan2(offset[1], focal_length))
-            
-            print(f"Pan: {pan_angle:.2f}°, Tilt: {tilt_angle:.2f}°")
-            
-            # Send via UDP (as two floats)
-            message = struct.pack('ff', pan_angle, tilt_angle)
-            sock.sendto(message, (args.ip, args.port))
-    
-    cv2.imshow("Face Tracker (Green Point)", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+    main()
