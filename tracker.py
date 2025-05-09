@@ -87,19 +87,24 @@ from std_msgs.msg import Float64MultiArray
 class FaceTracker(Node):
     def __init__(self):
         super().__init__('face_tracker')
+        self.get_logger().info('Initializing Face Tracker node...')
+        
         self.publisher = self.create_publisher(
             Float64MultiArray,
             '/head_forward_position_controller/commands',
             10
         )
+        self.get_logger().info('Created publisher for /head_forward_position_controller/commands')
         
         # Joint limits from URDF
         self.pan_limits = (-0.523, 0.523)  # head_0 joint limits in radians
         self.tilt_limits = (-0.35, 1.57)   # head_1 joint limits in radians
+        self.get_logger().info(f'Joint limits set - Pan: {self.pan_limits}, Tilt: {self.tilt_limits}')
         
         # MediaPipe setup
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False, refine_landmarks=True)
+        self.get_logger().info('MediaPipe face mesh initialized')
         
         # Landmark indices for the eyes
         self.LEFT_EYE = 468  # iris center left
@@ -110,11 +115,18 @@ class FaceTracker(Node):
         
         # Start video capture
         self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            self.get_logger().error('Failed to open video capture device')
+            return
+        self.get_logger().info('Video capture device opened successfully')
+        
         self.timer = self.create_timer(0.1, self.track_face)  # 10Hz update rate
+        self.get_logger().info('Face tracking timer started at 10Hz')
 
     def track_face(self):
         success, frame = self.cap.read()
         if not success:
+            self.get_logger().warning('Failed to read frame from video capture')
             return
 
         h, w, _ = frame.shape
@@ -153,20 +165,33 @@ class FaceTracker(Node):
                 msg.data = [pan_angle, tilt_angle]
                 self.publisher.publish(msg)
                 
-                # Print angles for debugging
-                self.get_logger().info(f'Pan: {math.degrees(pan_angle):.2f}°, Tilt: {math.degrees(tilt_angle):.2f}°')
+                # Log detailed information
+                self.get_logger().info(f'Face detected - Raw angles: Pan={math.degrees(pan_angle):.2f}°, Tilt={math.degrees(tilt_angle):.2f}°')
+                self.get_logger().info(f'Published message: {msg.data}')
+                self.get_logger().info(f'Green point position: x={green_point[0]:.2f}, y={green_point[1]:.2f}')
+                self.get_logger().info(f'Image center: x={center[0]:.2f}, y={center[1]:.2f}')
+                self.get_logger().info(f'Offset: x={offset[0]:.2f}, y={offset[1]:.2f}')
+        else:
+            self.get_logger().info('No face detected in frame')
         
         cv2.imshow("Face Tracker (Green Point)", frame)
         if cv2.waitKey(1) & 0xFF == 27:
+            self.get_logger().info('ESC pressed, shutting down...')
             self.destroy_node()
             rclpy.shutdown()
 
 def main():
     rclpy.init()
     face_tracker = FaceTracker()
-    rclpy.spin(face_tracker)
-    face_tracker.cap.release()
-    cv2.destroyAllWindows()
+    try:
+        rclpy.spin(face_tracker)
+    except KeyboardInterrupt:
+        face_tracker.get_logger().info('Keyboard interrupt received, shutting down...')
+    finally:
+        face_tracker.cap.release()
+        cv2.destroyAllWindows()
+        face_tracker.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
